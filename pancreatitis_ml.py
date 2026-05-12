@@ -183,15 +183,28 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _best_estimator():
-    """Return best available gradient boosting estimator.
+    """Return best available estimator.
 
-    Benchmark on this dataset (log1p target, 80/20 split, seed=42):
-      XGBoost + log1p  -> MAE 3.66  (best)
-      LightGBM + log1p -> MAE 3.96
-      XGBoost + raw    -> MAE 3.99
-      LightGBM + raw   -> MAE 4.59
-    => XGBoost with log1p target transform is used.
+    CatBoost is preferred because it handles missing values and categorical
+    features natively, which matches this dataset well. If it is unavailable,
+    fall back to XGBoost, then LightGBM, then RandomForest.
     """
+    try:
+        catboost_mod = __import__("catboost")
+        CatBoostRegressor = getattr(catboost_mod, "CatBoostRegressor")
+        est = CatBoostRegressor(
+            iterations=1200,
+            depth=6,
+            learning_rate=0.03,
+            loss_function="MAE",
+            random_seed=42,
+            verbose=False,
+            allow_writing_files=False,
+        )
+        return est, "CatBoost"
+    except ImportError:
+        pass
+
     try:
         from xgboost import XGBRegressor
         est = XGBRegressor(
@@ -235,6 +248,12 @@ def _best_estimator():
 
 
 def build_pipeline(X: pd.DataFrame) -> Pipeline:
+    est, name = _best_estimator()
+    print(f"  Estimator : {name}")
+
+    if name == "CatBoost":
+        return Pipeline([("model", est)])
+
     num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
 
@@ -250,8 +269,6 @@ def build_pipeline(X: pd.DataFrame) -> Pipeline:
     pre = ColumnTransformer([("num", num_tf, num_cols),
                               ("cat", cat_tf, cat_cols)], remainder="drop")
 
-    est, name = _best_estimator()
-    print(f"  Estimator : {name}")
     return Pipeline([("pre", pre), ("model", est)])
 
 
@@ -372,7 +389,7 @@ def train_and_evaluate(df: pd.DataFrame) -> dict:
 
     ba = bland_altman_plot(
         y_test.values, preds,
-        title="Bland-Altman Plot — LOS Prediction",
+        title="Bland-Altman Plot -- LOS Prediction",
         path=PLOTS_DIR / "bland_altman.png",
     )
     print(f"  Bland-Altman  bias={ba[0]:.2f}  SD={ba[1]:.2f}  "
@@ -384,6 +401,17 @@ def train_and_evaluate(df: pd.DataFrame) -> dict:
         "X_test": X_test, "y_test": y_test, "preds": preds,
         "feature_names": X.columns.tolist(),
     }
+
+
+def train_final_model(df: pd.DataFrame) -> Pipeline:
+    df = df[df[TARGET].notna()].copy()
+    X = df.drop(columns=[TARGET])
+    y_log = np.log1p(df[TARGET].astype(float))
+
+    print(f"\n  Refitting final model on all {len(X)} labeled rows ...")
+    final_pipeline = build_pipeline(X)
+    final_pipeline.fit(X, y_log)
+    return final_pipeline
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -458,8 +486,9 @@ def main():
     print("\n[6/6] Feature importance ...")
     imp_df = plot_feature_importance(results)
 
-    joblib.dump(results["pipeline"], "final_model_pipeline.joblib")
-    print("\n  [saved] final_model_pipeline.joblib")
+    final_pipeline = train_final_model(df)
+    joblib.dump(final_pipeline, "final_model_pipeline.joblib")
+    print("\n  [saved] final_model_pipeline.joblib (trained on 100% of train.csv)")
 
     print("\n" + "=" * 60)
     print("FINAL RESULTS")

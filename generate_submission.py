@@ -91,7 +91,7 @@ def main():
     pipeline = joblib.load(str(model_path))
 
     print("Predicting...")
-    # Model was trained on log1p(target) — back-transform with expm1
+    # Model was trained on log1p(target) -- back-transform with expm1
     predictions = np.expm1(pipeline.predict(test_df))
     predictions = np.maximum(predictions, 1.0)   # LOS >= 1 day
 
