@@ -16,9 +16,13 @@ import numpy as np
 def plot_feature_importance():
     """Create feature importance visualizations."""
     
-    csv_path = Path('feature_importance.csv')
+    # Look for CSV in parent directory (since this script is in graphs/ subfolder)
+    csv_path = Path('..') / 'feature_importance.csv'
     if not csv_path.exists():
-        print('feature_importance.csv not found.')
+        csv_path = Path('feature_importance.csv')
+    
+    if not csv_path.exists():
+        print(f'feature_importance.csv not found in current or parent directory.')
         return
     
     # Load data

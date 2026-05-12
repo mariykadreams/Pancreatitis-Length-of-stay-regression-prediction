@@ -45,8 +45,8 @@ def plot_feature_importance():
                 va='center', ha='left', fontsize=9, fontweight='bold')
     
     plt.tight_layout()
-    plt.savefig('feature_importance_top20.png', dpi=300, bbox_inches='tight')
-    print('Saved: feature_importance_top20.png')
+    plt.savefig('graphs/feature_importance_top20.png', dpi=300, bbox_inches='tight')
+    print('Saved: graphs/feature_importance_top20.png')
     plt.close()
     
     # Plot 2: All features (separated by positive/negative)
@@ -64,8 +64,8 @@ def plot_feature_importance():
     ax.axvline(x=0, color='black', linewidth=1.5, linestyle='-')
     
     plt.tight_layout()
-    plt.savefig('feature_importance_all.png', dpi=300, bbox_inches='tight')
-    print('Saved: feature_importance_all.png')
+    plt.savefig('graphs/feature_importance_all.png', dpi=300, bbox_inches='tight')
+    print('Saved: graphs/feature_importance_all.png')
     plt.close()
     
     # Plot 3: Clinical vs. Derived features breakdown
@@ -103,8 +103,8 @@ def plot_feature_importance():
     ax.grid(axis='y', alpha=0.3, linestyle='--')
     
     plt.tight_layout()
-    plt.savefig('feature_importance_comparison.png', dpi=300, bbox_inches='tight')
-    print('Saved: feature_importance_comparison.png')
+    plt.savefig('graphs/feature_importance_comparison.png', dpi=300, bbox_inches='tight')
+    print('Saved: graphs/feature_importance_comparison.png')
     plt.close()
     
     # Summary statistics
