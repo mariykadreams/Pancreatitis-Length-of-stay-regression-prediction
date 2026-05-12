@@ -349,6 +349,11 @@ def train_and_evaluate(df: pd.DataFrame) -> dict:
     preds     = np.expm1(preds_log)
     preds     = np.maximum(preds, 1.0)
 
+    # Clip extreme predictions at 95th percentile to reduce MAE inflation
+    cap = np.percentile(y_train, 95)
+    preds = np.clip(preds, 1.0, cap)
+    print(f"  Prediction cap (95th pct of train target): {cap:.2f} days")
+
     mae  = mean_absolute_error(y_test, preds)
     rmse = _rmse(y_test, preds)
     r2   = r2_score(y_test, preds)

@@ -95,6 +95,14 @@ def main():
     predictions = np.expm1(pipeline.predict(test_df))
     predictions = np.maximum(predictions, 1.0)   # LOS >= 1 day
 
+    # Clip extreme predictions at 95th percentile of training target
+    train_df = pd.read_csv("train.csv")
+    if "Length of stay" in train_df.columns:
+        y_train_cap = train_df["Length of stay"].dropna()
+        cap = np.percentile(y_train_cap, 95)
+        predictions = np.clip(predictions, 1.0, cap)
+        print(f"Clipped predictions to [{1.0:.2f}, {cap:.2f}] days (95th pct of train)")
+
     submission = pd.DataFrame({"ID": test_ids, "TARGET": predictions})
     submission_path = Path("submission.csv")
     submission.to_csv(submission_path, index=False)
