@@ -4,7 +4,12 @@
       "Bash(python pancreatitis_ml.py)",
       "Bash(pip install *)",
       "Bash(python -m pip install seaborn --quiet)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -m pip install lightgbm --quiet)",
+      "Bash(python -)",
+      "Bash(copy \"C:\\\\Users\\\\Lenovo\\\\Desktop\\\\uva\\\\INDUSTRIAL INFORMATICS\\\\project 2\\\\.claude\\\\worktrees\\\\serene-keller-8f1897\\\\pancreatitis_ml.py\" \"C:\\\\Users\\\\Lenovo\\\\Desktop\\\\uva\\\\INDUSTRIAL INFORMATICS\\\\project 2\\\\pancreatitis_ml.py\")",
+      "Bash(copy \"C:\\\\Users\\\\Lenovo\\\\Desktop\\\\uva\\\\INDUSTRIAL INFORMATICS\\\\project 2\\\\.claude\\\\worktrees\\\\serene-keller-8f1897\\\\generate_submission.py\" \"C:\\\\Users\\\\Lenovo\\\\Desktop\\\\uva\\\\INDUSTRIAL INFORMATICS\\\\project 2\\\\generate_submission.py\")",
+      "Bash(python generate_submission.py)"
     ]
   }
 }

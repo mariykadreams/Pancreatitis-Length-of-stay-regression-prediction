@@ -91,7 +91,9 @@ def main():
     pipeline = joblib.load(str(model_path))
 
     print("Predicting...")
-    predictions = np.maximum(pipeline.predict(test_df), 1.0)   # LOS >= 1 day
+    # Model was trained on log1p(target) — back-transform with expm1
+    predictions = np.expm1(pipeline.predict(test_df))
+    predictions = np.maximum(predictions, 1.0)   # LOS >= 1 day
 
     submission = pd.DataFrame({"ID": test_ids, "TARGET": predictions})
     submission_path = Path("submission.csv")

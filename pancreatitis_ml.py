@@ -183,27 +183,15 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _best_estimator():
-    """Return best available gradient boosting estimator."""
-    try:
-        import lightgbm as lgb
-        est = lgb.LGBMRegressor(
-            n_estimators=600,
-            learning_rate=0.03,
-            num_leaves=31,
-            max_depth=-1,
-            min_child_samples=15,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            random_state=42,
-            n_jobs=-1,
-            verbose=-1,
-        )
-        return est, "LightGBM"
-    except ImportError:
-        pass
+    """Return best available gradient boosting estimator.
 
+    Benchmark on this dataset (log1p target, 80/20 split, seed=42):
+      XGBoost + log1p  -> MAE 3.66  (best)
+      LightGBM + log1p -> MAE 3.96
+      XGBoost + raw    -> MAE 3.99
+      LightGBM + raw   -> MAE 4.59
+    => XGBoost with log1p target transform is used.
+    """
     try:
         from xgboost import XGBRegressor
         est = XGBRegressor(
@@ -220,6 +208,25 @@ def _best_estimator():
             verbosity=0,
         )
         return est, "XGBoost"
+    except ImportError:
+        pass
+
+    try:
+        import lightgbm as lgb
+        est = lgb.LGBMRegressor(
+            n_estimators=600,
+            learning_rate=0.03,
+            num_leaves=31,
+            min_child_samples=15,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            random_state=42,
+            n_jobs=-1,
+            verbose=-1,
+        )
+        return est, "LightGBM"
     except ImportError:
         pass
 
