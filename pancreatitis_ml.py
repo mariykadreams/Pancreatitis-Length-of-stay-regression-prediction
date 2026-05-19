@@ -2,10 +2,12 @@
 Pancreatitis Length-of-Stay Regression – Full ML Pipeline
 ==========================================================
 Improvements over baseline:
-  - log1p target transform  (skewness = 5.78 -> handles heavy right tail)
-  - LightGBM estimator       (usually outperforms XGBoost on small tabular data)
-  - Bland-Altman plot        (reveals systematic bias & heteroscedasticity)
-  - Within-N-days accuracy   (clinically meaningful thresholds)
+  - log1p target transform      (skewness = 5.78 -> handles heavy right tail)
+  - Missingness indicator flags  (>30% missing columns signal clinical severity)
+  - Optuna with RepeatedKFold    (5x3=15 evals/trial — much harder to overfit CV)
+  - Stacking ensemble            (XGBoost + LightGBM + CatBoost -> Ridge)
+  - Bland-Altman plot            (reveals systematic bias & heteroscedasticity)
+  - Within-N-days accuracy       (clinically meaningful thresholds)
   - Permutation feature importance
 
 Run:
@@ -22,6 +24,7 @@ warnings.filterwarnings("ignore")
 
 from pathlib import Path
 import math
+import re
 
 import numpy as np
 import pandas as pd
@@ -30,12 +33,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from sklearn.model_selection import train_test_split, KFold, cross_val_score
-from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import train_test_split, RepeatedKFold, cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.ensemble import RandomForestRegressor, StackingRegressor
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.inspection import permutation_importance
 
@@ -44,9 +47,41 @@ try:
 except ImportError:
     import pickle as joblib
 
+try:
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+except ImportError:
+    optuna = None
+
 PLOTS_DIR = Path("plots")
 PLOTS_DIR.mkdir(exist_ok=True)
-TARGET = "Length of stay"
+TARGET = "Length_of_stay"  # sanitized form of "Length of stay"
+
+# Columns with >30% missing — whether the value was observed at all is
+# clinically meaningful (mild cases are often discharged before 72h labs).
+# Listed using ORIGINAL names (before sanitization) so engineer_features
+# can create the _observed flags before renaming.
+HIGH_MISSING_COLS = [
+    "PCR_72h", "Creat_72h", "Hct_72h", "PMN_72h", "Lymph_72h",
+    "Leukocytes_72h", "Urea_72h", "Eosinophils_72h", "Mono_72h",
+    "PMN_Lymph_72h", "Col_total", "Amilasa", "PCO2",
+    "Exceso_Bases", "CO3_H", "Gasometr_a_Ph",
+]
+
+
+def sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace special characters in column names so LightGBM accepts them.
+
+    LightGBM rejects names containing JSON special chars (spaces, /, :, accents).
+    Replaces any non-alphanumeric/underscore character with '_', then collapses
+    consecutive underscores and strips leading/trailing ones.
+    """
+    new_names = {}
+    for col in df.columns:
+        safe = re.sub(r'[^a-zA-Z0-9_]', '_', col)
+        safe = re.sub(r'_+', '_', safe).strip('_')
+        new_names[col] = safe
+    return df.rename(columns=new_names)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,7 +114,6 @@ def missing_data_report(df: pd.DataFrame) -> pd.DataFrame:
     print(f"Columns with missing values : {len(report)}")
     print(report.to_string())
 
-    # heatmap
     cols = report.index.tolist()
     if cols:
         fig, ax = plt.subplots(figsize=(14, max(4, len(cols) * 0.35)))
@@ -90,7 +124,6 @@ def missing_data_report(df: pd.DataFrame) -> pd.DataFrame:
         fig.savefig(PLOTS_DIR / "missing_data_heatmap.png", dpi=120)
         plt.close(fig)
 
-    # bar chart
     top = report.head(20)
     if not top.empty:
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -146,12 +179,14 @@ def target_analysis(df: pd.DataFrame):
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
+    # Temporal deltas (admission → 48h / 72h)
+    # Column names are already sanitized (spaces→_, /→_) when this runs
     temporal_groups = [
-        ("PCR",        ["PCR Adm",        "PCR 48h",        "PCR 72h"]),
-        ("Creat",      ["Creat Adm",       "Creat 48h",      "Creat 72h"]),
-        ("Urea",       ["Urea Adm",        "Urea 48h",       "Urea 72h"]),
-        ("Leukocytes", ["Leukocytes Adm",  "Leukocytes 48h", "Leukocytes 72h"]),
-        ("Hct",        ["Hct Adm",         "Hct 48h",        "Hct 72h"]),
+        ("PCR",        ["PCR_Adm",        "PCR_48h",        "PCR_72h"]),
+        ("Creat",      ["Creat_Adm",       "Creat_48h",      "Creat_72h"]),
+        ("Urea",       ["Urea_Adm",        "Urea_48h",       "Urea_72h"]),
+        ("Leukocytes", ["Leukocytes_Adm",  "Leukocytes_48h", "Leukocytes_72h"]),
+        ("Hct",        ["Hct_Adm",         "Hct_48h",        "Hct_72h"]),
     ]
     for base, cols in temporal_groups:
         existing    = [c for c in cols if c in df.columns]
@@ -160,116 +195,150 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         if adm_cols and follow_cols:
             adm = adm_cols[0]
             for fc in follow_cols:
-                df[f"{base}_delta_{fc.split()[-1]}"] = df[fc] - df[adm]
+                df[f"{base}_delta_{fc.split('_')[-1]}"] = df[fc] - df[adm]
 
-    if "PCR Adm" in df.columns and "Albumin" in df.columns:
-        df["PCR_Albumin_ratio"] = df["PCR Adm"] / df["Albumin"].replace(0, np.nan)
+    if "PCR_Adm" in df.columns and "Albumin" in df.columns:
+        df["PCR_Albumin_ratio"] = df["PCR_Adm"] / df["Albumin"].replace(0, np.nan)
 
-    if "PMN Adm" in df.columns and "Lymphocytes Adm" in df.columns:
-        df["NLR_adm"] = df["PMN Adm"] / df["Lymphocytes Adm"].replace(0, np.nan)
+    if "PMN_Adm" in df.columns and "Lymphocytes_Adm" in df.columns:
+        df["NLR_adm"] = df["PMN_Adm"] / df["Lymphocytes_Adm"].replace(0, np.nan)
 
-    if "PMN 48h" in df.columns and "Lymph 48h" in df.columns:
-        df["NLR_48h"] = df["PMN 48h"] / df["Lymph 48h"].replace(0, np.nan)
+    if "PMN_48h" in df.columns and "Lymph_48h" in df.columns:
+        df["NLR_48h"] = df["PMN_48h"] / df["Lymph_48h"].replace(0, np.nan)
 
-    sev = [c for c in ["BISAP", "Ransom Adm", "SIRS", "CCI"] if c in df.columns]
+    sev = [c for c in ["BISAP", "Ransom_Adm", "SIRS", "CCI"] if c in df.columns]
     if sev:
         df["severity_composite"] = df[sev].fillna(0).sum(axis=1)
+
+    # Missingness indicator flags — 1 if value was observed, 0 if missing
+    for col in HIGH_MISSING_COLS:
+        if col in df.columns:
+            df[f"{col}_observed"] = df[col].notna().astype(int)
 
     return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ESTIMATOR
+# HYPERPARAMETER TUNING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _best_estimator():
-    """Return best available estimator.
+def tune_xgboost_params(X_train: pd.DataFrame, y_train: pd.Series,
+                        n_trials: int = 100) -> dict:
+    """Tune XGBoost with Optuna using RepeatedKFold (5 splits × 3 repeats = 15 evals/trial).
 
-    CatBoost is preferred because it handles missing values and categorical
-    features natively, which matches this dataset well. If it is unavailable,
-    fall back to XGBoost, then LightGBM, then RandomForest.
+    RepeatedKFold prevents Optuna from exploiting lucky single-split variance
+    over many trials — critical for small datasets like this one (~500 samples).
+    reg_lambda lower bound is 0.1 (not 1e-3) to prevent under-regularized models.
     """
-    try:
-        catboost_mod = __import__("catboost")
-        CatBoostRegressor = getattr(catboost_mod, "CatBoostRegressor")
-        est = CatBoostRegressor(
-            iterations=1200,
-            depth=6,
-            learning_rate=0.03,
-            loss_function="MAE",
-            random_seed=42,
-            verbose=False,
-            allow_writing_files=False,
-        )
-        return est, "CatBoost"
-    except ImportError:
-        pass
+    if optuna is None:
+        print("  [warning] Optuna not installed; using default XGBoost params")
+        return {}
 
     try:
         from xgboost import XGBRegressor
-        est = XGBRegressor(
-            n_estimators=500,
-            max_depth=5,
-            learning_rate=0.03,
-            subsample=0.8,
-            colsample_bytree=0.75,
-            min_child_weight=3,
-            gamma=0.05,
-            reg_alpha=0.3,
-            reg_lambda=1.5,
-            random_state=42,
-            verbosity=0,
+    except ImportError:
+        print("  [warning] XGBoost not available; skipping tuning")
+        return {}
+
+    print(f"\n  Tuning XGBoost params ({n_trials} trials, 5x3 RepeatedKFold) ...")
+
+    rkf = RepeatedKFold(n_splits=5, n_repeats=3, random_state=42)
+
+    def objective(trial):
+        params = {
+            "n_estimators":     trial.suggest_int("n_estimators", 200, 1000),
+            "max_depth":        trial.suggest_int("max_depth", 3, 8),
+            "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+            "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+            "reg_alpha":        trial.suggest_float("reg_alpha", 0.01, 5.0, log=True),
+            "reg_lambda":       trial.suggest_float("reg_lambda", 0.1, 5.0, log=True),
+        }
+        model = XGBRegressor(**params, random_state=42, verbosity=0)
+        scores = cross_val_score(
+            model, X_train, y_train, cv=rkf,
+            scoring="neg_mean_absolute_error", n_jobs=-1
         )
-        return est, "XGBoost"
+        return -scores.mean()
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    print(f"    Best CV MAE (log-space) : {-study.best_value:.4f}")
+    print(f"    Best params : {study.best_params}")
+
+    return study.best_params
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STACKING ENSEMBLE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_stacking_pipeline(xgb_params: dict = None) -> Pipeline:
+    """Build XGBoost + LightGBM + CatBoost stacking ensemble with Ridge meta-learner.
+
+    All three handle NaN natively so no imputation preprocessing is needed.
+    Falls back to a single estimator if libraries are missing.
+    """
+    base_estimators = []
+
+    # XGBoost — use Optuna-tuned params when provided
+    try:
+        from xgboost import XGBRegressor
+        defaults = {
+            "n_estimators": 500, "max_depth": 5, "learning_rate": 0.03,
+            "subsample": 0.8, "colsample_bytree": 0.75, "min_child_weight": 3,
+            "gamma": 0.05, "reg_alpha": 0.3, "reg_lambda": 1.5,
+        }
+        if xgb_params:
+            defaults.update(xgb_params)
+        base_estimators.append(("xgb", XGBRegressor(**defaults, random_state=42, verbosity=0)))
     except ImportError:
         pass
 
+    # LightGBM
     try:
         import lightgbm as lgb
-        est = lgb.LGBMRegressor(
-            n_estimators=600,
-            learning_rate=0.03,
-            num_leaves=31,
-            min_child_samples=15,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            random_state=42,
-            n_jobs=-1,
-            verbose=-1,
-        )
-        return est, "LightGBM"
+        base_estimators.append(("lgbm", lgb.LGBMRegressor(
+            n_estimators=600, learning_rate=0.03, num_leaves=31,
+            min_child_samples=15, subsample=0.8, colsample_bytree=0.8,
+            reg_alpha=0.1, reg_lambda=1.0,
+            random_state=42, n_jobs=-1, verbose=-1,
+        )))
     except ImportError:
         pass
 
-    return RandomForestRegressor(n_estimators=500, min_samples_leaf=2,
-                                 random_state=42, n_jobs=-1), "RandomForest"
-
-
-def build_pipeline(X: pd.DataFrame) -> Pipeline:
-    est, name = _best_estimator()
-    print(f"  Estimator : {name}")
-
-    if name == "CatBoost":
-        return Pipeline([("model", est)])
-
-    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
-
-    num_tf = Pipeline([("imp", SimpleImputer(strategy="median")),
-                       ("sc",  StandardScaler())])
+    # CatBoost
     try:
-        cat_tf = Pipeline([("imp", SimpleImputer(strategy="constant", fill_value="__missing__")),
-                           ("ohe", OneHotEncoder(handle_unknown="ignore", sparse=False))])
-    except TypeError:
-        cat_tf = Pipeline([("imp", SimpleImputer(strategy="constant", fill_value="__missing__")),
-                           ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False))])
+        from catboost import CatBoostRegressor
+        base_estimators.append(("cat", CatBoostRegressor(
+            iterations=800, depth=6, learning_rate=0.03, loss_function="MAE",
+            random_seed=42, verbose=False, allow_writing_files=False,
+        )))
+    except ImportError:
+        pass
 
-    pre = ColumnTransformer([("num", num_tf, num_cols),
-                              ("cat", cat_tf, cat_cols)], remainder="drop")
+    if len(base_estimators) >= 2:
+        names = " + ".join(n for n, _ in base_estimators)
+        print(f"  Stacking : {names} → Ridge")
+        stacker = StackingRegressor(
+            estimators=base_estimators,
+            final_estimator=Ridge(alpha=1.0),
+            cv=5,
+            n_jobs=1,  # avoid nested parallelism with base estimator n_jobs
+        )
+        return Pipeline([("model", stacker)])
 
-    return Pipeline([("pre", pre), ("model", est)])
+    # Fallback: single estimator
+    print("  [warning] < 2 estimators available; falling back to single model")
+    if base_estimators:
+        name, est = base_estimators[0]
+    else:
+        name, est = "RandomForest", RandomForestRegressor(
+            n_estimators=500, min_samples_leaf=2, random_state=42, n_jobs=-1)
+    print(f"  Estimator : {name}")
+    return Pipeline([("model", est)])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -335,24 +404,18 @@ def train_and_evaluate(df: pd.DataFrame) -> dict:
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=bins)
 
-    # ── log1p transform: target skewness is 5.78, strongly right-tailed ──────
     y_train_log = np.log1p(y_train)
 
     print(f"\n  Samples  : {len(X_train)} train | {len(X_test)} test")
     print(f"  Features : {X.shape[1]}")
 
-    pipe = build_pipeline(X_train)
+    xgb_params = tune_xgboost_params(X_train, y_train_log, n_trials=100)
+
+    pipe = build_stacking_pipeline(xgb_params=xgb_params)
     pipe.fit(X_train, y_train_log)
 
-    # Back-transform predictions to original scale
     preds_log = pipe.predict(X_test)
-    preds     = np.expm1(preds_log)
-    preds     = np.maximum(preds, 1.0)
-
-    # Clip extreme predictions at 95th percentile to reduce MAE inflation
-    cap = np.percentile(y_train, 95)
-    preds = np.clip(preds, 1.0, cap)
-    print(f"  Prediction cap (95th pct of train target): {cap:.2f} days")
+    preds     = np.maximum(np.expm1(preds_log), 1.0)
 
     mae  = mean_absolute_error(y_test, preds)
     rmse = _rmse(y_test, preds)
@@ -364,14 +427,6 @@ def train_and_evaluate(df: pd.DataFrame) -> dict:
     for n in [2, 3, 5]:
         print(f"  Within {n} days : {within_n_days(y_test, preds, n):.1f}%")
 
-    # 5-fold CV on log-transformed target
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    cv_raw = cross_val_score(pipe, X_train, y_train_log,
-                             cv=kf, scoring="neg_mean_absolute_error", n_jobs=-1)
-    # convert CV MAE from log-space back to approximate original-scale MAE
-    cv_mae_log = -cv_raw.mean()
-    print(f"  CV MAE log-space (5-fold) : {cv_mae_log:.4f} +/- {cv_raw.std():.4f}")
-
     # ── plots ─────────────────────────────────────────────────────────────────
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     res = y_test.values - preds
@@ -381,7 +436,8 @@ def train_and_evaluate(df: pd.DataFrame) -> dict:
     axes[0].set_ylabel("Residual")
     axes[0].set_title("Residual Plot")
 
-    mn, mx = min(y_test.min(), preds.min()), max(y_test.max(), preds.max())
+    mn = min(y_test.min(), preds.min())
+    mx = max(y_test.max(), preds.max())
     axes[1].scatter(y_test, preds, alpha=0.4, s=15, color="steelblue")
     axes[1].plot([mn, mx], [mn, mx], "r--")
     axes[1].set_xlabel("Actual LOS")
@@ -394,7 +450,7 @@ def train_and_evaluate(df: pd.DataFrame) -> dict:
 
     ba = bland_altman_plot(
         y_test.values, preds,
-        title="Bland-Altman Plot -- LOS Prediction",
+        title="Bland-Altman Plot — LOS Prediction (Stacking Ensemble)",
         path=PLOTS_DIR / "bland_altman.png",
     )
     print(f"  Bland-Altman  bias={ba[0]:.2f}  SD={ba[1]:.2f}  "
@@ -402,19 +458,20 @@ def train_and_evaluate(df: pd.DataFrame) -> dict:
 
     return {
         "pipeline": pipe,
+        "xgb_params": xgb_params,
         "mae": mae, "rmse": rmse, "r2": r2,
         "X_test": X_test, "y_test": y_test, "preds": preds,
         "feature_names": X.columns.tolist(),
     }
 
 
-def train_final_model(df: pd.DataFrame) -> Pipeline:
+def train_final_model(df: pd.DataFrame, xgb_params: dict = None) -> Pipeline:
     df = df[df[TARGET].notna()].copy()
-    X = df.drop(columns=[TARGET])
+    X     = df.drop(columns=[TARGET])
     y_log = np.log1p(df[TARGET].astype(float))
 
-    print(f"\n  Refitting final model on all {len(X)} labeled rows ...")
-    final_pipeline = build_pipeline(X)
+    print(f"\n  Refitting final stacking ensemble on all {len(X)} labeled rows ...")
+    final_pipeline = build_stacking_pipeline(xgb_params=xgb_params)
     final_pipeline.fit(X, y_log)
     return final_pipeline
 
@@ -429,9 +486,9 @@ def plot_feature_importance(results: dict, top_n: int = 20) -> pd.DataFrame:
     y_test     = results["y_test"]
     feat_names = results["feature_names"]
 
-    print("\n  Computing permutation importance ...")
+    print("\n  Computing permutation importance (stacking — may take a few minutes) ...")
     perm = permutation_importance(
-        pipe, X_test, np.log1p(y_test),   # importance on log-scale target
+        pipe, X_test, np.log1p(y_test),
         n_repeats=15, random_state=42, n_jobs=-1,
         scoring="neg_mean_absolute_error",
     )
@@ -453,7 +510,7 @@ def plot_feature_importance(results: dict, top_n: int = 20) -> pd.DataFrame:
             xerr=top["std"][::-1], color="steelblue", alpha=0.85,
             ecolor="grey", capsize=3)
     ax.set_xlabel("Mean permutation importance")
-    ax.set_title(f"Top {top_n} Feature Importances")
+    ax.set_title(f"Top {top_n} Feature Importances — Stacking Ensemble")
     plt.tight_layout()
     fig.savefig(PLOTS_DIR / "feature_importance.png", dpi=120)
     plt.close(fig)
@@ -473,6 +530,7 @@ def main():
 
     print("\n[1/6] Loading data ...")
     df = load_data(str(data_path))
+    df = sanitize_columns(df)  # sanitize early so all steps see clean names
     print(f"      Shape: {df.shape}")
 
     print("\n[2/6] Missing data audit ...")
@@ -485,13 +543,14 @@ def main():
     df = engineer_features(df)
     print(f"      Total features after engineering: {df.shape[1] - 1}")
 
-    print("\n[5/6] Training model (log1p target) ...")
+    print("\n[5/6] Training stacking ensemble (log1p target) ...")
     results = train_and_evaluate(df)
 
     print("\n[6/6] Feature importance ...")
     imp_df = plot_feature_importance(results)
 
-    final_pipeline = train_final_model(df)
+    # Refit final model on all data using the tuned XGBoost params
+    final_pipeline = train_final_model(df, xgb_params=results["xgb_params"])
     joblib.dump(final_pipeline, "final_model_pipeline.joblib")
     print("\n  [saved] final_model_pipeline.joblib (trained on 100% of train.csv)")
 
