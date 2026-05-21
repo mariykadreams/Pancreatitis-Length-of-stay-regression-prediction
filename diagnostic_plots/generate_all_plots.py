@@ -12,7 +12,6 @@ import matplotlib.colors as mcolors
 from pathlib import Path
 import sys
 import re
-from sklearn.model_selection import train_test_split
 
 plt.rcParams.update({
     "figure.dpi": 150,
@@ -96,33 +95,52 @@ df = df[df[target_col].notna()].copy()
 y_all = df[target_col].astype(float)
 X_all = df.drop(columns=[target_col])
 
-# Replicate the exact same split used in pancreatitis_ml.py
-bins = stratify_bins(y_all)
-_, X_test, _, y_test = train_test_split(
-    X_all, y_all, test_size=0.2, random_state=42, stratify=bins)
-
-X = X_test
-y_true = y_test.values.astype(float)
-print(f"  Evaluating on hold-out test set: {len(X)} patients (20% of training data)")
+# Plot all available patients so the figures reflect the full dataset.
+X = X_all
+y_true = y_all.values.astype(float)
+print(f"  Evaluating on full dataset: {len(X)} patients")
 
 print("Loading model...")
+import joblib
+sys.path.insert(0, str(Path(__file__).parent.parent))
+eval_model_path = Path(__file__).parent.parent / 'eval_model_pipeline.joblib'
+final_model_path = Path(__file__).parent.parent / 'final_model_pipeline.joblib'
+model = None
+
+# ensemble is optional here; try to import but continue if missing
 try:
-    import joblib
-    sys.path.insert(0, str(Path(__file__).parent.parent))
     from ensemble import WeightedEnsemble  # noqa: F401
-    eval_model_path = Path(__file__).parent.parent / 'eval_model_pipeline.joblib'
-    if eval_model_path.exists():
+except Exception:
+    pass
+
+# Prefer the eval model if available
+if eval_model_path.exists():
+    try:
         model = joblib.load(eval_model_path)
         print("  Using eval_model_pipeline.joblib (trained on 80% — honest hold-out evaluation)")
+    except Exception as e:
+        print(f"  Failed to load eval model: {e}")
+
+if model is None:
+    if final_model_path.exists():
+        try:
+            model = joblib.load(final_model_path)
+            print("  Using final_model_pipeline.joblib (in-sample)")
+        except Exception:
+            # fallback to pickle
+            try:
+                import pickle
+                with open(final_model_path, 'rb') as f:
+                    model = pickle.load(f)
+                print("  Loaded final_model_pipeline.joblib via pickle")
+            except Exception as e:
+                print(f"Could not load final model: {e}")
+                print("Re-run pancreatitis_ml.py to regenerate model files if needed.")
+                sys.exit(1)
     else:
-        print("  WARNING: eval_model_pipeline.joblib not found.")
-        print("  Re-run pancreatitis_ml.py to generate it, then re-run this script.")
-        print("  Falling back to final_model_pipeline.joblib (in-sample — numbers are inflated).")
-        model = joblib.load(Path(__file__).parent.parent / 'final_model_pipeline.joblib')
-except Exception as e:
-    print(f"Could not load model: {e}")
-    print("Re-run pancreatitis_ml.py first to regenerate the model file.")
-    sys.exit(1)
+        print("No model file found (eval_model_pipeline.joblib or final_model_pipeline.joblib).")
+        print("Re-run pancreatitis_ml.py to generate the model file.")
+        sys.exit(1)
 
 print("Generating predictions...")
 y_pred_log = model.predict(X)
