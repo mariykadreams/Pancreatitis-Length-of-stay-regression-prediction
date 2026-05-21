@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(.venv\\\\Scripts\\\\python.exe -c \"import py_compile; py_compile.compile\\('pancreatitis_ml.py', doraise=True\\); print\\('Syntax OK'\\)\")"
+      "Bash(.venv\\\\Scripts\\\\python.exe -c \"import py_compile; py_compile.compile\\('pancreatitis_ml.py', doraise=True\\); print\\('Syntax OK'\\)\")",
+      "Bash(python diagnostic_plots/generate_all_plots.py)"
     ]
   }
 }

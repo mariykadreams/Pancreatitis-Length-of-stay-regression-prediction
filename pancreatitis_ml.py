@@ -565,10 +565,14 @@ def main():
     print("\n[6/6] Feature importance ...")
     imp_df = plot_feature_importance(results)
 
+    # Save the 80%-trained pipeline so diagnostic plots use a true hold-out
+    joblib.dump(results["pipeline"], "eval_model_pipeline.joblib")
+    print("\n  [saved] eval_model_pipeline.joblib (trained on 80% of train.csv)")
+
     # Refit final model on all data using the tuned XGBoost params
     final_pipeline = train_final_model(df, xgb_params=results["xgb_params"])
     joblib.dump(final_pipeline, "final_model_pipeline.joblib")
-    print("\n  [saved] final_model_pipeline.joblib (trained on 100% of train.csv)")
+    print("  [saved] final_model_pipeline.joblib (trained on 100% of train.csv)")
 
     print("\n" + "=" * 60)
     print("FINAL RESULTS")

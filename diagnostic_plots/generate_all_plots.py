@@ -8,6 +8,7 @@ import matplotlib.colors as mcolors
 from pathlib import Path
 import sys
 import re
+from sklearn.model_selection import train_test_split
 
 plt.rcParams.update({
     "figure.dpi": 150,
@@ -71,6 +72,13 @@ def engineer_features(df):
 
 # ── load data & model ────────────────────────────────────────────────────────
 
+def stratify_bins(y: pd.Series, q: int = 10) -> pd.Series:
+    try:
+        return pd.qcut(y, q=q, labels=False, duplicates="drop")
+    except Exception:
+        return pd.cut(y, bins=q, labels=False)
+
+
 print("Loading data...")
 data_path = Path(__file__).parent.parent / 'train.csv'
 df = pd.read_csv(data_path, index_col=0)
@@ -80,16 +88,33 @@ df = sanitize_columns(df)
 df = engineer_features(df)
 
 target_col = "Length_of_stay"
-y_true = df[target_col].values.astype(float)
-X = df.drop(target_col, axis=1)
+df = df[df[target_col].notna()].copy()
+y_all = df[target_col].astype(float)
+X_all = df.drop(columns=[target_col])
+
+# Replicate the exact same split used in pancreatitis_ml.py
+bins = stratify_bins(y_all)
+_, X_test, _, y_test = train_test_split(
+    X_all, y_all, test_size=0.2, random_state=42, stratify=bins)
+
+X = X_test
+y_true = y_test.values.astype(float)
+print(f"  Evaluating on hold-out test set: {len(X)} patients (20% of training data)")
 
 print("Loading model...")
 try:
-    model_path = Path(__file__).parent.parent / 'final_model_pipeline.joblib'
     import joblib
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from ensemble import WeightedEnsemble  # noqa: F401
-    model = joblib.load(model_path)
+    eval_model_path = Path(__file__).parent.parent / 'eval_model_pipeline.joblib'
+    if eval_model_path.exists():
+        model = joblib.load(eval_model_path)
+        print("  Using eval_model_pipeline.joblib (trained on 80% — honest hold-out evaluation)")
+    else:
+        print("  WARNING: eval_model_pipeline.joblib not found.")
+        print("  Re-run pancreatitis_ml.py to generate it, then re-run this script.")
+        print("  Falling back to final_model_pipeline.joblib (in-sample — numbers are inflated).")
+        model = joblib.load(Path(__file__).parent.parent / 'final_model_pipeline.joblib')
 except Exception as e:
     print(f"Could not load model: {e}")
     print("Re-run pancreatitis_ml.py first to regenerate the model file.")
