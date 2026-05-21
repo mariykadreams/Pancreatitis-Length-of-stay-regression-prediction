@@ -34,13 +34,12 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from sklearn.model_selection import train_test_split, RepeatedKFold, cross_val_score
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.ensemble import RandomForestRegressor, StackingRegressor
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.inspection import permutation_importance
+
+from ensemble import WeightedEnsemble
 
 try:
     import joblib
@@ -56,6 +55,13 @@ except ImportError:
 PLOTS_DIR = Path("plots")
 PLOTS_DIR.mkdir(exist_ok=True)
 TARGET = "Length_of_stay"  # sanitized form of "Length of stay"
+
+# Runtime-focused defaults. These keep the pipeline structure intact while
+# cutting the most expensive search / ensemble steps.
+OPTUNA_TRIALS = 25
+OPTUNA_N_SPLITS = 3
+OPTUNA_N_REPEATS = 2
+PERMUTATION_REPEATS = 5
 
 # Columns with >30% missing — whether the value was observed at all is
 # clinically meaningful (mild cases are often discharged before 72h labs).
@@ -223,12 +229,12 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def tune_xgboost_params(X_train: pd.DataFrame, y_train: pd.Series,
-                        n_trials: int = 100) -> dict:
-    """Tune XGBoost with Optuna using RepeatedKFold (5 splits × 3 repeats = 15 evals/trial).
+                        n_trials: int = OPTUNA_TRIALS) -> dict:
+    """Tune XGBoost with Optuna using a lighter RepeatedKFold search.
 
-    RepeatedKFold prevents Optuna from exploiting lucky single-split variance
-    over many trials — critical for small datasets like this one (~500 samples).
-    reg_lambda lower bound is 0.1 (not 1e-3) to prevent under-regularized models.
+    Uses RMSE scoring so the search optimises for low error on extreme cases,
+    not just the easy short-stay majority. Passes sample_weight to each CV fold
+    so tuning sees the same upweighted long-stay signal as the final fit.
     """
     if optuna is None:
         print("  [warning] Optuna not installed; using default XGBoost params")
@@ -240,32 +246,36 @@ def tune_xgboost_params(X_train: pd.DataFrame, y_train: pd.Series,
         print("  [warning] XGBoost not available; skipping tuning")
         return {}
 
-    print(f"\n  Tuning XGBoost params ({n_trials} trials, 5x3 RepeatedKFold) ...")
+    print(f"\n  Tuning XGBoost params ({n_trials} trials, {OPTUNA_N_SPLITS}x{OPTUNA_N_REPEATS} RepeatedKFold, RMSE) ...")
 
-    rkf = RepeatedKFold(n_splits=5, n_repeats=3, random_state=42)
+    rkf = RepeatedKFold(n_splits=OPTUNA_N_SPLITS, n_repeats=OPTUNA_N_REPEATS, random_state=42)
 
     def objective(trial):
         params = {
-            "n_estimators":     trial.suggest_int("n_estimators", 200, 1000),
-            "max_depth":        trial.suggest_int("max_depth", 3, 8),
+            "n_estimators":     trial.suggest_int("n_estimators", 100, 400),
+            "max_depth":        trial.suggest_int("max_depth", 3, 6),
             "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
             "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
             "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
             "reg_alpha":        trial.suggest_float("reg_alpha", 0.01, 5.0, log=True),
             "reg_lambda":       trial.suggest_float("reg_lambda", 0.1, 5.0, log=True),
+            "objective":        "reg:squarederror",
         }
         model = XGBRegressor(**params, random_state=42, verbosity=0)
+        # RMSE scoring: penalises large errors hard so tuning finds params
+        # that generalise to rare long-stay patients, not just the short-stay majority.
         scores = cross_val_score(
             model, X_train, y_train, cv=rkf,
-            scoring="neg_mean_absolute_error", n_jobs=-1
+            scoring="neg_root_mean_squared_error",
+            n_jobs=-1,
         )
         return -scores.mean()
 
     study = optuna.create_study(direction="minimize")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
-    print(f"    Best CV MAE (log-space) : {-study.best_value:.4f}")
+    print(f"    Best CV RMSE (log-space) : {study.best_value:.4f}")
     print(f"    Best params : {study.best_params}")
 
     return study.best_params
@@ -275,21 +285,24 @@ def tune_xgboost_params(X_train: pd.DataFrame, y_train: pd.Series,
 # STACKING ENSEMBLE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_stacking_pipeline(xgb_params: dict = None) -> Pipeline:
-    """Build XGBoost + LightGBM + CatBoost stacking ensemble with Ridge meta-learner.
+def build_stacking_pipeline(xgb_params: dict = None) -> WeightedEnsemble:
+    """Build XGBoost + LightGBM + CatBoost weighted ensemble.
 
-    All three handle NaN natively so no imputation preprocessing is needed.
-    Falls back to a single estimator if libraries are missing.
+    Uses WeightedEnsemble instead of StackingRegressor so that sample_weight
+    is properly propagated to every base estimator during training.
+    Loss functions are set to RMSE / Huber (not MAE) so the model is
+    penalised hard for extreme underpredictions on rare long-stay patients.
     """
     base_estimators = []
 
-    # XGBoost — use Optuna-tuned params when provided
+    # XGBoost — RMSE objective penalises large errors proportionally
     try:
         from xgboost import XGBRegressor
         defaults = {
-            "n_estimators": 500, "max_depth": 5, "learning_rate": 0.03,
+            "n_estimators": 300, "max_depth": 5, "learning_rate": 0.03,
             "subsample": 0.8, "colsample_bytree": 0.75, "min_child_weight": 3,
             "gamma": 0.05, "reg_alpha": 0.3, "reg_lambda": 1.5,
+            "objective": "reg:squarederror",
         }
         if xgb_params:
             defaults.update(xgb_params)
@@ -297,48 +310,39 @@ def build_stacking_pipeline(xgb_params: dict = None) -> Pipeline:
     except ImportError:
         pass
 
-    # LightGBM
+    # LightGBM — Huber loss (α=0.9): robust for small errors, MSE-like for large ones
     try:
         import lightgbm as lgb
         base_estimators.append(("lgbm", lgb.LGBMRegressor(
-            n_estimators=600, learning_rate=0.03, num_leaves=31,
-            min_child_samples=15, subsample=0.8, colsample_bytree=0.8,
+            n_estimators=350, learning_rate=0.03, num_leaves=31,
+            min_child_samples=5,  # smaller leaves so rare long-stay splits can form
+            subsample=0.8, colsample_bytree=0.8,
             reg_alpha=0.1, reg_lambda=1.0,
+            objective="huber", alpha=0.9,
             random_state=42, n_jobs=-1, verbose=-1,
         )))
     except ImportError:
         pass
 
-    # CatBoost
+    # CatBoost — RMSE instead of MAE; MAE's constant gradient ignores outlier magnitude
     try:
         from catboost import CatBoostRegressor
         base_estimators.append(("cat", CatBoostRegressor(
-            iterations=800, depth=6, learning_rate=0.03, loss_function="MAE",
+            iterations=400, depth=6, learning_rate=0.03,
+            loss_function="RMSE",
             random_seed=42, verbose=False, allow_writing_files=False,
         )))
     except ImportError:
         pass
 
-    if len(base_estimators) >= 2:
-        names = " + ".join(n for n, _ in base_estimators)
-        print(f"  Stacking : {names} → Ridge")
-        stacker = StackingRegressor(
-            estimators=base_estimators,
-            final_estimator=Ridge(alpha=1.0),
-            cv=5,
-            n_jobs=1,  # avoid nested parallelism with base estimator n_jobs
-        )
-        return Pipeline([("model", stacker)])
+    if not base_estimators:
+        print("  [warning] No estimators available; falling back to RandomForest")
+        rf = RandomForestRegressor(n_estimators=500, min_samples_leaf=2, random_state=42, n_jobs=-1)
+        return WeightedEnsemble([("rf", rf)])
 
-    # Fallback: single estimator
-    print("  [warning] < 2 estimators available; falling back to single model")
-    if base_estimators:
-        name, est = base_estimators[0]
-    else:
-        name, est = "RandomForest", RandomForestRegressor(
-            n_estimators=500, min_samples_leaf=2, random_state=42, n_jobs=-1)
-    print(f"  Estimator : {name}")
-    return Pipeline([("model", est)])
+    names = " + ".join(n for n, _ in base_estimators)
+    print(f"  Ensemble  : {names} (averaged, sample_weight forwarded to each)")
+    return WeightedEnsemble(base_estimators)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -406,13 +410,21 @@ def train_and_evaluate(df: pd.DataFrame) -> dict:
 
     y_train_log = np.log1p(y_train)
 
+    # Upweight rare long-stay patients so models learn to predict them.
+    # log1p^1.5 gives a 140-day patient ~4.5× the weight of a 1-day patient
+    # while still being smooth enough not to destabilise training.
+    sample_weights = np.power(np.log1p(y_train.values), 1.5)
+    sample_weights /= sample_weights.mean()  # normalise: keeps effective lr stable
+
     print(f"\n  Samples  : {len(X_train)} train | {len(X_test)} test")
     print(f"  Features : {X.shape[1]}")
+    print(f"  Weight range : {sample_weights.min():.2f} – {sample_weights.max():.2f}  "
+          f"(median {np.median(sample_weights):.2f})")
 
-    xgb_params = tune_xgboost_params(X_train, y_train_log, n_trials=100)
+    xgb_params = tune_xgboost_params(X_train, y_train_log)
 
     pipe = build_stacking_pipeline(xgb_params=xgb_params)
-    pipe.fit(X_train, y_train_log)
+    pipe.fit(X_train, y_train_log, sample_weight=sample_weights)
 
     preds_log = pipe.predict(X_test)
     preds     = np.maximum(np.expm1(preds_log), 1.0)
@@ -465,14 +477,18 @@ def train_and_evaluate(df: pd.DataFrame) -> dict:
     }
 
 
-def train_final_model(df: pd.DataFrame, xgb_params: dict = None) -> Pipeline:
+def train_final_model(df: pd.DataFrame, xgb_params: dict = None) -> WeightedEnsemble:
     df = df[df[TARGET].notna()].copy()
     X     = df.drop(columns=[TARGET])
-    y_log = np.log1p(df[TARGET].astype(float))
+    y     = df[TARGET].astype(float)
+    y_log = np.log1p(y)
 
-    print(f"\n  Refitting final stacking ensemble on all {len(X)} labeled rows ...")
+    sample_weights = np.power(np.log1p(y.values), 1.5)
+    sample_weights /= sample_weights.mean()
+
+    print(f"\n  Refitting final ensemble on all {len(X)} labeled rows ...")
     final_pipeline = build_stacking_pipeline(xgb_params=xgb_params)
-    final_pipeline.fit(X, y_log)
+    final_pipeline.fit(X, y_log, sample_weight=sample_weights)
     return final_pipeline
 
 
@@ -489,7 +505,7 @@ def plot_feature_importance(results: dict, top_n: int = 20) -> pd.DataFrame:
     print("\n  Computing permutation importance (stacking — may take a few minutes) ...")
     perm = permutation_importance(
         pipe, X_test, np.log1p(y_test),
-        n_repeats=15, random_state=42, n_jobs=-1,
+        n_repeats=PERMUTATION_REPEATS, random_state=42, n_jobs=-1,
         scoring="neg_mean_absolute_error",
     )
 

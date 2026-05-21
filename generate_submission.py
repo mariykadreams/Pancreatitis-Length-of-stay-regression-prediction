@@ -21,6 +21,8 @@ try:
 except ImportError:
     import pickle as joblib
 
+from ensemble import WeightedEnsemble  # noqa: F401 — needed for joblib to unpickle the model
+
 # Must exactly mirror HIGH_MISSING_COLS in pancreatitis_ml.py
 HIGH_MISSING_COLS = [
     "PCR_72h", "Creat_72h", "Hct_72h", "PMN_72h", "Lymph_72h",
@@ -117,13 +119,8 @@ def main():
     # a global +1.2 day shift hurts short-stay predictions (the majority)
     # more than it helps long-stay predictions.
 
-    # Clip at 95th percentile of training target
-    if train_path.exists():
-        train_df = pd.read_csv(train_path)
-        if "Length of stay" in train_df.columns:
-            cap = np.percentile(train_df["Length of stay"].dropna(), 95)
-            predictions = np.clip(predictions, 1.0, cap)
-            print(f"Clipped predictions to [1.00, {cap:.2f}] days (95th pct of train)")
+    # Only prevent negative predictions; allow full range
+    print("No clipping applied — allowing predictions to reach their full range")
 
     submission = pd.DataFrame({"ID": test_ids, "TARGET": predictions})
     submission_path = Path("submission.csv")

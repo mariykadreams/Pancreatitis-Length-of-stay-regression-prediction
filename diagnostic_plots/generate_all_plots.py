@@ -1,16 +1,28 @@
 # Generate all diagnostic plots from predictions
-# This script generates predictions and saves all diagnostic plots
-# Run from main project directory: python diagnostic_plots/generate_all_plots.py
+# Run from project root: python diagnostic_plots/generate_all_plots.py
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 from pathlib import Path
 import sys
 import re
 
+plt.rcParams.update({
+    "figure.dpi": 150,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.grid": True,
+    "grid.alpha": 0.25,
+    "font.size": 11,
+})
+
+PLOTS_DIR = Path(__file__).parent
+PLOTS_DIR.mkdir(exist_ok=True)
+
+
 def sanitize_columns(df):
-    """Convert special characters in column names to underscores."""
     new_names = {}
     for col in df.columns:
         safe = re.sub(r'[^a-zA-Z0-9_]', '_', col)
@@ -18,11 +30,9 @@ def sanitize_columns(df):
         new_names[col] = safe
     return df.rename(columns=new_names)
 
+
 def engineer_features(df):
-    """Apply feature engineering transformations."""
     df = df.copy()
-    
-    # Temporal deltas
     temporal_groups = [
         ("PCR",        ["PCR_Adm", "PCR_48h", "PCR_72h"]),
         ("Creat",      ["Creat_Adm", "Creat_48h", "Creat_72h"]),
@@ -38,23 +48,15 @@ def engineer_features(df):
             adm = adm_cols[0]
             for fc in follow_cols:
                 df[f"{base}_delta_{fc.split('_')[-1]}"] = df[fc] - df[adm]
-    
-    # Ratios
     if "PCR_Adm" in df.columns and "Albumin" in df.columns:
         df["PCR_Albumin_ratio"] = df["PCR_Adm"] / df["Albumin"].replace(0, np.nan)
-    
     if "PMN_Adm" in df.columns and "Lymphocytes_Adm" in df.columns:
         df["NLR_adm"] = df["PMN_Adm"] / df["Lymphocytes_Adm"].replace(0, np.nan)
-    
     if "PMN_48h" in df.columns and "Lymph_48h" in df.columns:
         df["NLR_48h"] = df["PMN_48h"] / df["Lymph_48h"].replace(0, np.nan)
-    
-    # Composite severity
     sev = [c for c in ["BISAP", "Ransom_Adm", "SIRS", "CCI"] if c in df.columns]
     if sev:
         df["severity_composite"] = df[sev].fillna(0).sum(axis=1)
-    
-    # Missingness flags
     HIGH_MISSING_COLS = [
         "PCR_72h", "Creat_72h", "Hct_72h", "PMN_72h", "Lymph_72h",
         "Leukocytes_72h", "Urea_72h", "Eosinophils_72h", "Mono_72h",
@@ -64,171 +66,267 @@ def engineer_features(df):
     for col in HIGH_MISSING_COLS:
         if col in df.columns:
             df[f"{col}_observed"] = df[col].notna().astype(int)
-    
     return df
+
+
+# ── load data & model ────────────────────────────────────────────────────────
 
 print("Loading data...")
 data_path = Path(__file__).parent.parent / 'train.csv'
 df = pd.read_csv(data_path, index_col=0)
-
-# Drop ID column if present
 if "ID" in df.columns:
     df.drop(columns=["ID"], inplace=True)
-
-# Sanitize column names
 df = sanitize_columns(df)
-
-# Engineer features
 df = engineer_features(df)
 
-# Separate target
-target_col = "Length_of_stay"  # sanitized name
-y_true = df[target_col].values
+target_col = "Length_of_stay"
+y_true = df[target_col].values.astype(float)
 X = df.drop(target_col, axis=1)
 
-print("Loading model... (this may take a moment)")
+print("Loading model...")
 try:
     model_path = Path(__file__).parent.parent / 'final_model_pipeline.joblib'
     import joblib
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from ensemble import WeightedEnsemble  # noqa: F401
     model = joblib.load(model_path)
 except Exception as e:
-    print(f"Warning: Could not load model with joblib: {e}")
-    print("Please run this from the project root: python -c \"from pancreatitis_ml import model; import joblib; joblib.dump(model, 'final_model_pipeline.joblib')\"")
+    print(f"Could not load model: {e}")
+    print("Re-run pancreatitis_ml.py first to regenerate the model file.")
     sys.exit(1)
 
 print("Generating predictions...")
-y_pred = model.predict(X)
+y_pred_log = model.predict(X)
+y_pred = np.maximum(np.expm1(y_pred_log), 1.0)
 
-print("\n" + "="*50)
-print("DIAGNOSTIC PLOTS GENERATED")
-print("="*50)
+# ── shared metrics ───────────────────────────────────────────────────────────
 
-# 1. BLAND-ALTMAN PLOT
-print("\n[1/6] Creating Bland-Altman Plot...")
-mean = (y_true + y_pred) / 2
-diff = y_pred - y_true
-bias = np.mean(diff)
-std = np.std(diff)
-loa_upper = bias + 1.96 * std
-loa_lower = bias - 1.96 * std
+abs_err   = np.abs(y_true - y_pred)
+errors    = y_pred - y_true
+mae       = abs_err.mean()
+rmse      = np.sqrt(((y_true - y_pred) ** 2).mean())
+ss_res    = ((y_true - y_pred) ** 2).sum()
+ss_tot    = ((y_true - y_true.mean()) ** 2).sum()
+r2        = 1 - ss_res / ss_tot
+within    = {n: (abs_err <= n).mean() * 100 for n in [2, 3, 5, 7, 10]}
 
-plt.figure(figsize=(10, 7))
-plt.scatter(mean, diff, alpha=0.6, s=30)
-plt.axhline(bias, linestyle='--', linewidth=2, label=f'Bias = {bias:.2f}')
-plt.axhline(loa_upper, linestyle='--', color='red', linewidth=2, label=f'+1.96 SD = {loa_upper:.2f}')
-plt.axhline(loa_lower, linestyle='--', color='red', linewidth=2, label=f'-1.96 SD = {loa_lower:.2f}')
-plt.xlabel('Mean LOS (days)', fontsize=12)
-plt.ylabel('Prediction Error (days)', fontsize=12)
-plt.title('Bland–Altman Plot', fontsize=14, fontweight='bold')
-plt.legend(fontsize=10)
-plt.grid(alpha=0.3)
+print(f"\n  MAE={mae:.2f}d  RMSE={rmse:.2f}d  R²={r2:.3f}")
+for n, pct in within.items():
+    print(f"  Within {n:2d} days: {pct:.1f}%")
+
+# LOS bucket labels (used in several plots)
+bucket_edges  = [0, 3, 7, 14, 30, 200]
+bucket_labels = ["1–3 d", "4–7 d", "8–14 d", "15–30 d", ">30 d"]
+bucket_ids    = pd.cut(y_true, bins=bucket_edges, labels=bucket_labels)
+
+print("\n" + "=" * 55)
+print("GENERATING PLOTS")
+print("=" * 55)
+
+
+# ── 1. ACTUAL vs PREDICTED ──────────────────────────────────────────────────
+# Coloured by absolute error; ±3d and ±7d accuracy bands shown.
+print("\n[1/6] Actual vs Predicted (colour = absolute error)...")
+
+fig, ax = plt.subplots(figsize=(8, 7))
+
+vmax = np.percentile(abs_err, 90)
+sc = ax.scatter(y_true, y_pred, c=abs_err, cmap="RdYlGn_r",
+                vmin=0, vmax=vmax, s=40, alpha=0.75, edgecolors="none")
+plt.colorbar(sc, ax=ax, label="Absolute error (days)")
+
+lim = max(y_true.max(), y_pred.max()) * 1.05
+ax.plot([0, lim], [0, lim], "k--", lw=1.5, label="Perfect")
+for band, color in [(3, "#2196F3"), (7, "#FF9800")]:
+    ax.fill_between([0, lim], [0 - band, lim - band], [0 + band, lim + band],
+                    alpha=0.08, color=color, label=f"±{band} day band")
+    ax.plot([0, lim], [0 + band, lim + band], color=color, lw=0.8, ls="--")
+    ax.plot([0, lim], [0 - band, lim - band], color=color, lw=0.8, ls="--")
+
+ax.set_xlim(0, lim); ax.set_ylim(0, lim)
+ax.set_xlabel("Actual LOS (days)"); ax.set_ylabel("Predicted LOS (days)")
+ax.set_title("Actual vs Predicted LOS", fontweight="bold")
+ax.legend(fontsize=9, loc="upper left")
+
+metrics_txt = (f"MAE  = {mae:.2f} d\nRMSE = {rmse:.2f} d\nR²   = {r2:.3f}\n"
+               f"Within 3d: {within[3]:.1f}%\nWithin 7d: {within[7]:.1f}%")
+ax.text(0.97, 0.05, metrics_txt, transform=ax.transAxes, fontsize=9,
+        va="bottom", ha="right",
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.85))
+
 plt.tight_layout()
-plt.savefig('diagnostic_plots/01_bland_altman_plot.png', dpi=300, bbox_inches='tight')
-plt.close()
-print(f"   ✓ Bias: {bias:.4f} | Std Dev: {std:.4f}")
+fig.savefig(PLOTS_DIR / "01_actual_vs_predicted.png", dpi=300, bbox_inches="tight")
+plt.close(fig)
+print(f"   MAE={mae:.2f}  RMSE={rmse:.2f}  R²={r2:.3f}")
 
-# 2. ACTUAL VS PREDICTED
-print("[2/6] Creating Actual vs Predicted Plot...")
-mae = np.mean(np.abs(y_true - y_pred))
-mse = np.mean((y_true - y_pred) ** 2)
-rmse = np.sqrt(mse)
-ss_res = np.sum((y_true - y_pred) ** 2)
-ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-r2 = 1 - (ss_res / ss_tot)
 
-plt.figure(figsize=(10, 8))
-plt.scatter(y_true, y_pred, alpha=0.6, s=50, edgecolors='k', linewidth=0.5)
-min_val = min(y_true.min(), y_pred.min())
-max_val = max(y_true.max(), y_pred.max())
-plt.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2.5, label='Perfect Prediction')
-plt.xlabel('Actual LOS (days)', fontsize=12)
-plt.ylabel('Predicted LOS (days)', fontsize=12)
-plt.title('Actual vs Predicted Values', fontsize=14, fontweight='bold')
-plt.legend(fontsize=11)
-plt.grid(alpha=0.3)
+# ── 2. WITHIN-N-DAYS ACCURACY ───────────────────────────────────────────────
+# Horizontal bar chart — the most clinically meaningful accuracy metric.
+print("[2/6] Within-N-days accuracy bar chart...")
+
+thresholds = [1, 2, 3, 5, 7, 10, 14]
+pcts = [(abs_err <= t).mean() * 100 for t in thresholds]
+colors_bar = ["#d32f2f" if p < 50 else "#f57c00" if p < 70 else "#388e3c" for p in pcts]
+
+fig, ax = plt.subplots(figsize=(8, 5))
+bars = ax.barh([f"Within {t} day{'s' if t > 1 else ''}" for t in thresholds],
+               pcts, color=colors_bar, edgecolor="white", height=0.6)
+ax.axvline(80, color="grey", lw=1.2, ls="--", label="80% reference")
+ax.set_xlim(0, 105)
+ax.set_xlabel("% of patients")
+ax.set_title("Within-N-Days Prediction Accuracy", fontweight="bold")
+for bar, pct in zip(bars, pcts):
+    ax.text(bar.get_width() + 1, bar.get_y() + bar.get_height() / 2,
+            f"{pct:.1f}%", va="center", fontsize=10)
+ax.legend(fontsize=9)
 plt.tight_layout()
-plt.savefig('diagnostic_plots/02_actual_vs_predicted.png', dpi=300, bbox_inches='tight')
-plt.close()
-print(f"   ✓ R² Score: {r2:.4f} | MAE: {mae:.4f} | RMSE: {rmse:.4f}")
+fig.savefig(PLOTS_DIR / "02_within_n_days_accuracy.png", dpi=300, bbox_inches="tight")
+plt.close(fig)
+print(f"   Within 3d: {within[3]:.1f}%  |  Within 7d: {within[7]:.1f}%")
 
-# 3. RESIDUALS PLOT
-print("[3/6] Creating Residuals Plot...")
-residuals = y_pred - y_true
 
-plt.figure(figsize=(10, 7))
-plt.scatter(y_pred, residuals, alpha=0.6, s=50, edgecolors='k', linewidth=0.5)
-plt.axhline(0, linestyle='--', linewidth=2.5, color='red', label='Zero Error')
-plt.xlabel('Fitted Values (Predicted LOS)', fontsize=12)
-plt.ylabel('Residuals', fontsize=12)
-plt.title('Residual Plot (Homoscedasticity Check)', fontsize=14, fontweight='bold')
-plt.legend(fontsize=11)
-plt.grid(alpha=0.3)
+# ── 3. ERROR BOXPLOTS BY LOS BUCKET ─────────────────────────────────────────
+# Shows clearly where the model is accurate and where it struggles.
+print("[3/6] Error boxplots by LOS bucket...")
+
+groups = [errors[bucket_ids == label] for label in bucket_labels]
+counts = [len(g) for g in groups]
+non_empty = [(lbl, g, n) for lbl, g, n in zip(bucket_labels, groups, counts) if n > 0]
+
+fig, ax = plt.subplots(figsize=(9, 5))
+bp = ax.boxplot([g for _, g, _ in non_empty], patch_artist=True, widths=0.5,
+                medianprops=dict(color="black", lw=2))
+palette = ["#4CAF50", "#2196F3", "#FF9800", "#E91E63", "#9C27B0"]
+for patch, color in zip(bp["boxes"], palette[:len(non_empty)]):
+    patch.set_facecolor(color); patch.set_alpha(0.6)
+
+ax.axhline(0, color="red", lw=1.5, ls="--", label="Zero error")
+ax.set_xticks(range(1, len(non_empty) + 1))
+ax.set_xticklabels([f"{lbl}\n(n={n})" for lbl, _, n in non_empty])
+ax.set_ylabel("Prediction error (days)")
+ax.set_title("Prediction Error by LOS Bucket\n"
+             "(box = IQR, line = median, whiskers = 1.5×IQR)", fontweight="bold")
+ax.legend(fontsize=9)
 plt.tight_layout()
-plt.savefig('diagnostic_plots/03_residuals_plot.png', dpi=300, bbox_inches='tight')
-plt.close()
-print(f"   ✓ Mean Residual: {np.mean(residuals):.4f} | Std Dev: {np.std(residuals):.4f}")
+fig.savefig(PLOTS_DIR / "03_error_by_los_bucket.png", dpi=300, bbox_inches="tight")
+plt.close(fig)
+for lbl, g, n in non_empty:
+    print(f"   {lbl:8s}: median error = {np.median(g):+.1f} d  (n={n})")
 
-# 4. ERROR DISTRIBUTION
-print("[4/6] Creating Error Distribution Plot...")
-errors = y_pred - y_true
 
-plt.figure(figsize=(10, 7))
-plt.hist(errors, bins=40, alpha=0.7, edgecolor='black', color='steelblue')
-plt.axvline(np.mean(errors), color='red', linestyle='--', linewidth=2.5, label=f'Mean = {np.mean(errors):.2f}')
-plt.axvline(np.median(errors), color='green', linestyle='--', linewidth=2.5, label=f'Median = {np.median(errors):.2f}')
-plt.xlabel('Prediction Error (days)', fontsize=12)
-plt.ylabel('Frequency', fontsize=12)
-plt.title('Distribution of Prediction Errors', fontsize=14, fontweight='bold')
-plt.legend(fontsize=11)
-plt.grid(alpha=0.3, axis='y')
+# ── 4. BLAND–ALTMAN (improved) ───────────────────────────────────────────────
+# Points coloured by LOS bucket; polynomial trend shows heteroscedasticity.
+print("[4/6] Bland–Altman plot with trend line...")
+
+mean_vals = (y_true + y_pred) / 2
+bias      = errors.mean()
+sd        = errors.std()
+loa_hi    = bias + 1.96 * sd
+loa_lo    = bias - 1.96 * sd
+pct_out   = ((errors > loa_hi) | (errors < loa_lo)).mean() * 100
+
+fig, ax = plt.subplots(figsize=(9, 6))
+
+bucket_colors = {"1–3 d": "#4CAF50", "4–7 d": "#2196F3",
+                 "8–14 d": "#FF9800", "15–30 d": "#E91E63", ">30 d": "#9C27B0"}
+for label in bucket_labels:
+    mask = bucket_ids == label
+    if mask.sum():
+        ax.scatter(mean_vals[mask], errors[mask], s=35, alpha=0.7,
+                   color=bucket_colors[label], label=label, edgecolors="none")
+
+# LOA band
+ax.axhspan(loa_lo, loa_hi, alpha=0.07, color="grey")
+ax.axhline(bias,   ls="--", lw=2,   color="navy",  label=f"Bias = {bias:+.2f} d")
+ax.axhline(loa_hi, ls="--", lw=1.5, color="crimson", label=f"+1.96 SD = {loa_hi:.2f} d")
+ax.axhline(loa_lo, ls="--", lw=1.5, color="crimson", label=f"−1.96 SD = {loa_lo:.2f} d")
+
+# Trend line (shows growing bias with LOS)
+z = np.polyfit(mean_vals, errors, 1)
+xfit = np.linspace(mean_vals.min(), mean_vals.max(), 200)
+ax.plot(xfit, np.poly1d(z)(xfit), color="darkorange", lw=2, ls="-", label="Trend")
+
+ax.set_xlabel("Mean of Actual & Predicted LOS (days)")
+ax.set_ylabel("Prediction error  Predicted − Actual (days)")
+ax.set_title(f"Bland–Altman Plot  ({pct_out:.1f}% outside LOA)", fontweight="bold")
+ax.legend(fontsize=8, ncol=2, loc="lower left")
 plt.tight_layout()
-plt.savefig('diagnostic_plots/04_error_distribution.png', dpi=300, bbox_inches='tight')
-plt.close()
-print(f"   ✓ Mean Error: {np.mean(errors):.4f} | Median: {np.median(errors):.4f}")
+fig.savefig(PLOTS_DIR / "04_bland_altman.png", dpi=300, bbox_inches="tight")
+plt.close(fig)
+print(f"   Bias={bias:+.2f}d  SD={sd:.2f}d  Outside LOA={pct_out:.1f}%")
 
-# 5. Q-Q PLOT (manual implementation)
-print("[5/6] Creating Q-Q Plot...")
-sorted_residuals = np.sort(residuals)
-n = len(sorted_residuals)
-theoretical_quantiles = np.sort(np.random.standard_normal(n))
 
-plt.figure(figsize=(10, 7))
-plt.scatter(theoretical_quantiles, sorted_residuals, alpha=0.6, s=50)
-min_val = min(theoretical_quantiles.min(), sorted_residuals.min())
-max_val = max(theoretical_quantiles.max(), sorted_residuals.max())
-plt.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2.5)
-plt.title('Q-Q Plot - Normality Assessment', fontsize=14, fontweight='bold')
-plt.xlabel('Theoretical Quantiles', fontsize=12)
-plt.ylabel('Sample Quantiles', fontsize=12)
-plt.grid(alpha=0.3)
+# ── 5. ABSOLUTE ERROR DISTRIBUTION ──────────────────────────────────────────
+# Histogram of absolute errors with cumulative line; annotates key percentiles.
+print("[5/6] Absolute error distribution...")
+
+fig, ax1 = plt.subplots(figsize=(9, 5))
+ax2 = ax1.twinx()
+
+bins = np.arange(0, abs_err.max() + 2, 1)
+ax1.hist(abs_err, bins=bins, color="steelblue", alpha=0.7, edgecolor="white",
+         label="Absolute error count")
+
+sorted_ae = np.sort(abs_err)
+cdf = np.arange(1, len(sorted_ae) + 1) / len(sorted_ae) * 100
+ax2.plot(sorted_ae, cdf, color="darkorange", lw=2.5, label="Cumulative %")
+
+for t, color in [(3, "#388e3c"), (7, "#f57c00"), (14, "#d32f2f")]:
+    pct = (abs_err <= t).mean() * 100
+    ax2.axvline(t, color=color, lw=1.5, ls="--")
+    ax2.text(t + 0.3, pct + 2, f"{pct:.0f}%\n≤{t}d", color=color, fontsize=9, va="bottom")
+
+ax1.set_xlabel("Absolute prediction error (days)")
+ax1.set_ylabel("Number of patients", color="steelblue")
+ax2.set_ylabel("Cumulative % of patients", color="darkorange")
+ax2.set_ylim(0, 110)
+ax1.set_title("Absolute Error Distribution", fontweight="bold")
+
+lines1, labels1 = ax1.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=9, loc="center right")
 plt.tight_layout()
-plt.savefig('diagnostic_plots/05_qq_plot.png', dpi=300, bbox_inches='tight')
-plt.close()
-print(f"   ✓ Q-Q plot created")
+fig.savefig(PLOTS_DIR / "05_absolute_error_distribution.png", dpi=300, bbox_inches="tight")
+plt.close(fig)
+p50, p75, p90 = np.percentile(abs_err, [50, 75, 90])
+print(f"   p50={p50:.1f}d  p75={p75:.1f}d  p90={p90:.1f}d")
 
-# 6. ERROR BY PREDICTION
-print("[6/6] Creating Error by Prediction Plot...")
-abs_errors = np.abs(y_pred - y_true)
 
-plt.figure(figsize=(10, 7))
-plt.scatter(y_pred, abs_errors, alpha=0.6, s=50, edgecolors='k', linewidth=0.5)
-z = np.polyfit(y_pred, abs_errors, 2)
-p = np.poly1d(z)
-y_trend = p(np.sort(y_pred))
-plt.plot(np.sort(y_pred), y_trend, "r--", linewidth=2.5, label='Trend (degree 2)')
-plt.xlabel('Predicted LOS (days)', fontsize=12)
-plt.ylabel('Absolute Error (days)', fontsize=12)
-plt.title('Absolute Error vs Predicted Values', fontsize=14, fontweight='bold')
-plt.legend(fontsize=11)
-plt.grid(alpha=0.3)
+# ── 6. RESIDUALS vs ACTUAL (heteroscedasticity) ──────────────────────────────
+# Coloured by absolute error; shows if variance grows with LOS.
+print("[6/6] Residuals vs Actual LOS...")
+
+fig, ax = plt.subplots(figsize=(9, 5))
+sc = ax.scatter(y_true, errors, c=abs_err, cmap="RdYlGn_r",
+                vmin=0, vmax=np.percentile(abs_err, 90),
+                s=35, alpha=0.75, edgecolors="none")
+plt.colorbar(sc, ax=ax, label="Absolute error (days)")
+
+ax.axhline(0,    color="black",  lw=1.5, ls="--", label="Zero error")
+ax.axhline(mae,  color="#FF9800", lw=1.2, ls=":",  label=f"+MAE ({mae:.1f}d)")
+ax.axhline(-mae, color="#FF9800", lw=1.2, ls=":",  label=f"−MAE ({mae:.1f}d)")
+
+ax.set_xlabel("Actual LOS (days)")
+ax.set_ylabel("Prediction error  Predicted − Actual (days)")
+ax.set_title("Residuals vs Actual LOS\n(colour = absolute error magnitude)",
+             fontweight="bold")
+ax.legend(fontsize=9, loc="upper right")
 plt.tight_layout()
-plt.savefig('diagnostic_plots/06_error_by_prediction.png', dpi=300, bbox_inches='tight')
-plt.close()
-print(f"   ✓ Mean Absolute Error: {np.mean(abs_errors):.4f}")
+fig.savefig(PLOTS_DIR / "06_residuals_vs_actual.png", dpi=300, bbox_inches="tight")
+plt.close(fig)
+print(f"   Mean residual={errors.mean():+.2f}d  Std={errors.std():.2f}d")
 
-print("\n" + "="*50)
-print("✓ ALL PLOTS SAVED TO: diagnostic_plots/")
-print("="*50)
-print("\nFiles created:")
-for i in range(1, 7):
-    print(f"   0{i}_*.png")
+
+print("\n" + "=" * 55)
+print("ALL PLOTS SAVED TO: diagnostic_plots/")
+print("=" * 55)
+files = [
+    "01_actual_vs_predicted.png       — scatter coloured by error, ±3/7d bands",
+    "02_within_n_days_accuracy.png    — bar chart of clinical accuracy thresholds",
+    "03_error_by_los_bucket.png       — boxplots per LOS group",
+    "04_bland_altman.png              — bias/LOA + trend line",
+    "05_absolute_error_distribution.png — histogram + CDF",
+    "06_residuals_vs_actual.png       — heteroscedasticity check",
+]
+for f in files:
+    print(f"  {f}")
