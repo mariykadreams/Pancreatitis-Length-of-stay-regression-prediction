@@ -8,6 +8,7 @@ import matplotlib.colors as mcolors
 from pathlib import Path
 import sys
 import re
+from sklearn.model_selection import train_test_split
 
 plt.rcParams.update({
     "figure.dpi": 150,
@@ -69,6 +70,13 @@ def engineer_features(df):
     return df
 
 
+def stratify_bins(y: pd.Series, q: int = 10) -> pd.Series:
+    try:
+        return pd.qcut(y, q=q, labels=False, duplicates="drop")
+    except Exception:
+        return pd.cut(y, bins=q, labels=False)
+
+
 # ── load data & model ────────────────────────────────────────────────────────
 
 print("Loading data...")
@@ -80,8 +88,19 @@ df = sanitize_columns(df)
 df = engineer_features(df)
 
 target_col = "Length_of_stay"
-y_true = df[target_col].values.astype(float)
+y_series = df[target_col].astype(float)
 X = df.drop(target_col, axis=1)
+
+# Reproduce the same 20% stratified hold-out used during training in
+# `pancreatitis_ml.py`. This ensures diagnostic plots evaluate the exact
+# held-out slice (test_size=0.2, random_state=42, stratify by LOS quantile bins).
+bins = stratify_bins(y_series)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_series, test_size=0.2, random_state=42, stratify=bins)
+
+# Use held-out data for diagnostics
+y_true = y_test.values.astype(float)
+X = X_test
 
 print("Loading model...")
 try:
