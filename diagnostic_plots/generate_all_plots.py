@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Generate all diagnostic plots from predictions
+Generate all diagnostic plots from predictions using HONEST HOLD-OUT EVALUATION
 Run from project root: python diagnostic_plots/generate_all_plots.py
 
-This script aggregates multiple diagnostic plot routines into one file.
+This script evaluates the model on a stratified 20% hold-out test set (same as training),
+ensuring diagnostics reflect true generalization, not in-sample overfitting.
+
+Updated: Now uses stratified train-test split (test_size=0.2, random_state=42)
+matching the evaluation methodology used in pancreatitis_ml.py.
 """
 import numpy as np
 import pandas as pd
@@ -83,6 +87,8 @@ def stratify_bins(y: pd.Series, q: int = 10) -> pd.Series:
 
 
 print("Loading data...")
+from sklearn.model_selection import train_test_split
+
 data_path = Path(__file__).parent.parent / 'train.csv'
 df = pd.read_csv(data_path, index_col=0)
 if "ID" in df.columns:
@@ -92,13 +98,20 @@ df = engineer_features(df)
 
 target_col = "Length_of_stay"
 df = df[df[target_col].notna()].copy()
-y_all = df[target_col].astype(float)
-X_all = df.drop(columns=[target_col])
+y_series = df[target_col].astype(float)
+X_full = df.drop(columns=[target_col])
 
-# Plot all available patients so the figures reflect the full dataset.
-X = X_all
-y_true = y_all.values.astype(float)
-print(f"  Evaluating on full dataset: {len(X)} patients")
+# Reproduce the same 20% stratified hold-out used during training in pancreatitis_ml.py
+# This ensures diagnostic plots evaluate the exact held-out slice (test_size=0.2, random_state=42).
+bins = stratify_bins(y_series)
+X_train, X_test, y_train, y_test = train_test_split(
+    X_full, y_series, test_size=0.2, random_state=42, stratify=bins)
+
+# Use HOLD-OUT TEST SET for honest evaluation (not in-sample)
+X = X_test
+y_true = y_test.values.astype(float)
+print(f"  Evaluating on HOLD-OUT TEST SET: {len(X)} patients (20% stratified split, random_state=42)")
+print(f"  Training set: {len(X_train)} patients")
 
 print("Loading model...")
 import joblib
